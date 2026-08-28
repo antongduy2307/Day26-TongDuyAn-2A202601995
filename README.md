@@ -18,13 +18,19 @@ day26-mcp/
 │   ├── weather_server.py
 │   └── weather_client.py
 │
-└── 03-production/           ← Bước 3: Auth, Tool Registry, Versioning
+├── 03-production/           ← Bước 3: Auth, Tool Registry, Versioning
+│   ├── README.md
+│   ├── auth_server.py
+│   ├── auth_client.py
+│   ├── registry.json
+│   ├── registry_client.py
+│   └── versioned_server.py
+│
+└── 04-lab/                  ← Bước 4: Lab — server thật, 2 client, Inspector
     ├── README.md
-    ├── auth_server.py
-    ├── auth_client.py
-    ├── registry.json
-    ├── registry_client.py
-    └── versioned_server.py
+    ├── claude_desktop_config.json
+    ├── mcp-server/          ← 3 tools + 3 resources + 2 prompts
+    └── mcp-client/          ← ADK agent đóng vai MCP client
 ```
 
 ## Quick start
@@ -47,6 +53,14 @@ python auth_client.py              # terminal 2
 
 # Production — Tool Registry
 cd 03-production && python registry_client.py
+```
+
+Lab 04 dùng `uv` thay vì pip, và chạy trên PowerShell (xem [`04-lab/README.md`](04-lab/README.md)):
+
+```powershell
+cd 04-lab\mcp-server ; uv sync ; uv run python weather.py      # terminal 1
+cd 04-lab\mcp-server ; uv run python test_server.py            # terminal 2
+cd 04-lab\mcp-client ; uv sync ; uv run adk web                # terminal 3
 ```
 
 ---
@@ -229,4 +243,205 @@ Chi tiết + code cho cả 3 phần: xem [`03-production/README.md`](03-producti
 
 ---
 
+## [Lab thực hành](04-lab/)
+
+Server thật gọi WeatherAPI.com, phục vụ đồng thời hai client qua hai transport khác nhau
+mà không sửa dòng code nào — đó là điều MCP hứa hẹn, và lab này kiểm chứng nó.
+
+```
+   Streamable HTTP  ┌──────────────┐  stdio
+  ┌────────────────▶│  weather.py  │◀────────────────┐
+  │  :8085/mcp      │              │                 │
+┌─┴──────────┐      │ 3 tools      │      ┌──────────┴──────────┐
+│ ADK Agent  │      │ 3 resources  │      │ Claude Desktop      │
+│ (adk web)  │      │ 2 prompts    │      │ / MCP Inspector     │
+└────────────┘      └──────────────┘      └─────────────────────┘
+```
+
+Điểm khác ba bài trước: có **Resources và Prompts** (không chỉ Tools), có **structured
+error** thay vì chuỗi lỗi, và có **test đường lỗi** chứ không chỉ đường thành công.
+
+---
+
+## Vấn đề N×M — gốc rễ của MCP
+
+Trước MCP, mỗi cặp (AI provider × công cụ) cần một adapter riêng:
+
+```
+Trước MCP: N×M adapter              Sau MCP: N+M adapter
+
+OpenAI    ─┬─ Database              OpenAI    ─┐         ┌─ Database
+Anthropic ─┼─ GitHub                Anthropic ─┼── MCP ──┼─ GitHub
+Google    ─┴─ Slack                 Google    ─┘         └─ Slack
+
+3 × 3 = 9 adapter                   3 + 3 = 6 adapter
+Thêm 1 provider = viết 3 cái mới    Thêm 1 provider = viết 1 cái
+```
+
+Con số nhỏ ở ví dụ này nhưng tăng theo tích. 10 provider × 20 tool = 200 adapter,
+so với 30. Đây chính là điều mà "USB-C cho AI" nói tới.
+
+---
+
+## Kiến trúc Host, Client, Server
+
+Ba vai khác nhau, hay bị gộp làm một khi mới học:
+
+```
+┌──────────────────┐
+│      HOST        │  Claude Desktop, Cursor, ADK — nơi chứa LLM và giao diện
+│  (LLM + UI)      │
+└────────┬─────────┘
+         │ tạo ra, mỗi server một client
+    ┌────┴────┬──────────┐
+    ▼         ▼          ▼
+┌────────┐ ┌────────┐ ┌────────┐
+│Client 1│ │Client 2│ │Client 3│  giữ 1:1 một kết nối, nói JSON-RPC 2.0
+└───┬────┘ └───┬────┘ └───┬────┘
+    ▼          ▼          ▼
+┌────────┐ ┌────────┐ ┌────────┐
+│Server  │ │Server  │ │Server  │  chạy tool thật, không biết gì về LLM
+│postgres│ │github  │ │weather │
+└────────┘ └────────┘ └────────┘
+```
+
+| Ranh giới tin cậy | Nội dung |
+|---|---|
+| Host **tin** Client | Cùng process, cùng chủ sở hữu |
+| Client **xác minh** Server | Auth, kiểm danh tính, kiểm capability |
+| Server **validate mọi input** | Không giả định client lành tính |
+
+Giao thức bên dưới là **JSON-RPC 2.0** — cùng một định dạng thông điệp cho cả stdio
+lẫn HTTP. Đổi transport không đổi ngữ nghĩa.
+
+**Capability negotiation**: lúc `initialize`, client và server khai báo chúng hỗ trợ gì
+trước khi dùng. Nhờ vậy client mới nói chuyện được với server cũ và ngược lại.
+
+---
+
+## Sáu primitive của MCP
+
+Đây là điểm bị bỏ sót nhiều nhất. Hầu hết team chỉ dùng Tools rồi kết luận
+"MCP chỉ là function calling đổi tên" — bỏ lỡ đúng phần quan trọng.
+
+| Primitive | Ai kiểm soát | Vai trò | Ví dụ |
+|---|---|---|---|
+| **Tools** | LLM quyết định gọi | Hành động hoặc truy vấn | `query_db()`, `send_email()` |
+| **Resources** | App/host chủ động đọc | Dữ liệu chỉ đọc theo URI | `file://docs/guide.md` |
+| **Prompts** | User chọn | Template tương tác dùng lại | template `summarize-code` |
+| **Roots** | Client chia sẻ | Phạm vi workspace an toàn cho server | thư mục dự án đang mở |
+| **Sampling** | Server yêu cầu | Server nhờ host/LLM suy luận hộ | server cần tóm tắt trước khi trả |
+| **Elicitation** | Server hỏi user | Xin thêm thông tin qua UI của host | form nhập ngày tháng |
+
+Ba cái đầu trả lời: **server cung cấp được gì cho host?**
+Ba cái sau trả lời: **server cần host hỗ trợ gì để hoàn tất công việc?**
+
+MCP là giao thức **trao đổi context**, không chỉ giao thức gọi tool. Dùng Resources
+cho dynamic context injection thay vì hardcode vào system prompt — xem
+[`04-lab/`](04-lab/) làm mẫu.
+
+---
+
+## MCP Inspector — công cụ bắt buộc
+
+Test tool **trước khi** cắm vào LLM. Lý do: khi agent trả lời sai, bạn không phân biệt
+được model chọn sai tool hay tool trả sai dữ liệu. Inspector loại LLM khỏi vòng lặp
+nên câu trả lời rõ ngay.
+
+```bash
+npx @modelcontextprotocol/inspector python weather_server.py
+```
+
+Thứ tự debug hiệu quả: **Inspector trước → log của client → trace ở tầng cao hơn**.
+
+Cần kiểm cả ba: schema tool đúng chưa, output format đúng chưa, và **error response**
+trông thế nào. Mục thứ ba hay bị bỏ, mà đó lại là chỗ tool giết agent trong production.
+
+Bản chạy bằng lệnh: [`04-lab/mcp-server/test_server.py`](04-lab/mcp-server/test_server.py).
+
+---
+
+## Sáu anti-pattern về bảo mật
+
+| Anti-pattern | Vì sao nguy hiểm |
+|---|---|
+| Expose MCP server ra internet không auth | Chấp nhận cho cả thế giới gọi tool nội bộ |
+| Tin "read-only" là tuyệt đối an toàn | Prompt injection biến đường đọc thành đường rò dữ liệu |
+| Nhồi quá nhiều tool vào context | Model đốt token đọc catalog thay vì giải task |
+| Tool description mơ hồ | Model gọi sai tool dù backend hoàn toàn đúng |
+| Không log/audit tool call | Có sự cố thì không biết tool nào đã chạy |
+| Trộn credential sandbox với production | Thử nghiệm local nhưng cầm token prod full quyền |
+
+Bốn tầng phòng thủ, xếp chồng chứ không thay thế nhau:
+
+```
+1. Transport   OAuth 2.0 cho HTTP, TLS
+2. Validation  validate mọi input ở phía server
+3. Permission  mỗi tool chỉ đúng quyền cần thiết
+4. Audit       log mọi lần gọi tool kèm kết quả
+```
+
+stdio chạy local không cần OAuth. HTTP ra khỏi máy thì **bắt buộc**.
+
+Tin tưởng người viết MCP server là **cần** nhưng **không đủ** — vẫn phải có
+permissioning, review output, xác nhận trước khi ghi, và audit.
+
+---
+
+## MCP năm 2026 — khác gì giai đoạn đầu
+
+| Thay đổi | Nội dung |
+|---|---|
+| Transport | Remote production nghiêng hẳn về `streamable-http`; SSE thành legacy ở nhiều client |
+| Capability negotiation | Trở thành tư duy cốt lõi, không phải chi tiết kỹ thuật phụ |
+| Không chỉ tools | Resources, prompts, roots, sampling, elicitation đều có vai trò thật |
+| Scale problem | Host có hàng trăm tool thì context window và latency thành nút thắt |
+| Governance | Chuyển vào Agentic AI Foundation (Linux Foundation) để tránh khoá theo một vendor |
+
+Hệ sinh thái: 10.000+ server công khai, 97 triệu lượt tải SDK mỗi tháng. Đã đi từ
+"giao thức của Anthropic" sang chuẩn trung lập — ChatGPT, Cursor, Gemini, Microsoft
+Copilot, VS Code đều đã hỗ trợ. **A2A** (Agent-to-Agent) bổ sung cho MCP ở mảng
+agent nói chuyện với agent.
+
+### Server hay dùng trong thực tế
+
+| Server | Dùng để làm gì | Khi nào nên dùng |
+|---|---|---|
+| GitHub MCP | Repo, issue, PR, code search | Vòng lặp ticket → code → PR |
+| Sentry MCP | Error, stack trace, release regression | Debug sự cố production rồi mở fix ngay |
+| Context7 MCP | Docs của thư viện theo đúng version | Framework thay đổi nhanh |
+| Playwright MCP | Browser automation, E2E check | Tái hiện bug UI và verify fix |
+| Slack / Notion MCP | Chat, spec, wiki context | Lấy quyết định, requirement, handoff |
+
+Chọn server theo **workflow thật**, không cài cho có. Nhồi một "tool zoo" không gắn
+với task nào chỉ làm agent chậm và chọn sai.
+
+### Ba workflow có ROI cao
+
+1. **Ticket → code → PR**: GitHub MCP + docs MCP
+2. **Prod error → root cause**: Sentry MCP + GitHub MCP
+3. **Library upgrade → migration**: Context7 + Playwright MCP
+
+Điểm chung: đều là **closed loop** — đọc đúng context, hành động nhỏ, verify ngay.
+MCP mạnh nhất khi có feedback loop, không phải khi có nhiều tool.
+
+---
+
+## Production checklist
+
+- [ ] Bắt đầu từ workflow thật, không từ danh sách tool muốn có
+- [ ] Tool name + description viết cho model chọn đúng ngay lần đầu
+- [ ] Output gọn; payload thô để trong resource hoặc fetch-on-demand
+- [ ] Dùng Inspector trước khi test trong client thật
+- [ ] Transport đúng chỗ: stdio cho local, HTTP cho dịch vụ dùng chung
+- [ ] Tách scope đọc/ghi, log mọi hành động ghi, có xác nhận của người khi cần
+- [ ] Lỗi trả structured, không raise exception qua ranh giới MCP
+- [ ] Với Claude Code/Codex: hướng dẫn agent bằng server naming, instructions, `AGENTS.md`, hooks
+
+---
+
 **Tóm lại:** Function Calling là *cơ chế model gọi công cụ*; MCP là *chuẩn để kết nối model với các công cụ đó* — và MCP thực chất dùng Function Calling làm nền tảng để hoạt động.
+
+Nhưng nếu chỉ dừng ở đó thì bỏ lỡ phần quan trọng nhất. MCP không phải "function calling
+đổi tên": nó thêm **tool discovery** lúc runtime, **context control** qua resources và
+prompts, và **khả năng tương thích chéo giữa nhiều client**.

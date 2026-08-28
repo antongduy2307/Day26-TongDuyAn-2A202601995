@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "weather": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "E:\\VinAI\\Week_6\\Day 26\\Day26-TongDuyAn-2A202601995\\04-lab\\mcp-server",
+        "run",
+        "python",
+        "weather.py",
+        "--stdio"
+      ],
+      "env": {
+        "WEATHERAPI_KEY": "PASTE_YOUR_WEATHERAPI_KEY_HERE"
+      }
+    }
+  }
+}

@@ -1,156 +1,176 @@
 #!/usr/bin/env python3
+"""Kiểm tra setup của Weather Agent trước khi chạy `adk web`.
+
+Chạy: uv run python verify_setup.py
 """
-Verification script for Weather Agent setup
-Checks if all components are configured correctly
-"""
+
+import asyncio
 import os
 import sys
 from pathlib import Path
 
-def check_environment():
-    """Check if .env file exists and is configured"""
-    print("🔍 Checking environment configuration...")
-    
-    env_file = Path(".env")
-    if not env_file.exists():
-        print("❌ .env file not found")
-        print("   Run: echo 'GOOGLE_API_KEY=your_key' > .env")
+# Console Windows mặc định dùng cp1252, không in được tiếng Việt và sẽ ném
+# UnicodeEncodeError ngay khi khởi động. Ép UTF-8 cho stdout/stderr.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8085/mcp")
+
+
+def check_environment() -> bool:
+    """Kiểm tra .env và API key. Chấp nhận .env ở gốc repo hoặc trong thư mục này."""
+    print("[1/5] Cấu hình môi trường")
+
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:
+        print("  FAIL: chưa cài python-dotenv. Chạy: uv sync")
         return False
-    
-    # Check if GOOGLE_API_KEY is set
-    from dotenv import load_dotenv
-    load_dotenv()
-    
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key or api_key == "your_google_api_key_here":
-        print("❌ GOOGLE_API_KEY not configured in .env")
-        print("   Get key from: https://aistudio.google.com/apikey")
+
+    env_path = find_dotenv(usecwd=False)
+    if not env_path:
+        print("  FAIL: không tìm thấy file .env nào từ thư mục này trở lên")
+        print('  Sửa: Set-Content -Path "..\\..\\.env" -Value "GEMINI_API_KEY=<key>" -Encoding ascii')
         return False
-    
-    print(f"✅ GOOGLE_API_KEY configured ({api_key[:10]}...)")
+
+    load_dotenv(env_path)
+    print(f"  OK: đọc .env tại {env_path}")
+
+    # google-genai đọc GOOGLE_API_KEY; tài liệu Gemini hay dùng GEMINI_API_KEY.
+    api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        print("  FAIL: thiếu GOOGLE_API_KEY (hoặc GEMINI_API_KEY)")
+        print("  Lấy key tại https://aistudio.google.com/apikey")
+        return False
+    print(f"  OK: Gemini key đã đặt ({api_key[:6]}...{api_key[-4:]})")
+
+    # Server đọc key này. Thiếu thì agent vẫn chat được nhưng tool trả lỗi.
+    if not os.getenv("WEATHERAPI_KEY"):
+        print("  WARN: thiếu WEATHERAPI_KEY — server sẽ trả lỗi có cấu trúc thay vì dữ liệu")
+        print("  Lấy key free tại https://www.weatherapi.com/")
+    else:
+        print("  OK: WEATHERAPI_KEY đã đặt")
+
     return True
 
-def check_dependencies():
-    """Check if required packages are installed"""
-    print("\n🔍 Checking dependencies...")
-    
-    required_packages = [
-        ("google.adk", "Google ADK"),
-        ("google.generativeai", "Google Generative AI"),
-        ("mcp", "MCP"),
-        ("fastmcp", "FastMCP"),
+
+def check_dependencies() -> bool:
+    print("\n[2/5] Thư viện")
+    packages = [
+        ("google.adk", "google-adk"),
+        ("mcp", "mcp"),
         ("dotenv", "python-dotenv"),
         ("httpx", "httpx"),
     ]
-    
-    all_installed = True
-    for package, name in required_packages:
+
+    ok = True
+    for module, name in packages:
         try:
-            __import__(package)
-            print(f"✅ {name}")
+            __import__(module)
+            print(f"  OK: {name}")
         except ImportError:
-            print(f"❌ {name} not installed")
-            all_installed = False
-    
-    if not all_installed:
-        print("\n   Install with: uv sync")
-        print("   Or: pip install google-adk google-generativeai mcp fastmcp python-dotenv httpx")
-    
-    return all_installed
+            print(f"  FAIL: thiếu {name}")
+            ok = False
 
-def check_agent_structure():
-    """Check if agent directory structure is correct"""
-    print("\n🔍 Checking agent structure...")
-    
-    required_files = [
-        "weather_agent/agent.py",
-        "weather_agent/__init__.py",
-    ]
-    
-    all_exist = True
-    for file_path in required_files:
-        path = Path(file_path)
-        if path.exists():
-            print(f"✅ {file_path}")
+    if not ok:
+        print("  Sửa: uv sync")
+    return ok
+
+
+def check_agent_structure() -> bool:
+    print("\n[3/5] Cấu trúc agent")
+    ok = True
+    for rel in ("weather_agent/agent.py", "weather_agent/__init__.py"):
+        if Path(rel).exists():
+            print(f"  OK: {rel}")
         else:
-            print(f"❌ {file_path} not found")
-            all_exist = False
-    
-    return all_exist
+            print(f"  FAIL: thiếu {rel}")
+            ok = False
+    return ok
 
-def check_mcp_server():
-    """Check if MCP server is accessible"""
-    print("\n🔍 Checking MCP server connectivity...")
-    
-    server_url = "https://weather-mcp-server-oze7nwnjba-as.a.run.app"
-    
+
+def check_mcp_server() -> bool:
+    """Bắt tay MCP thật với server, không chỉ ping HTTP.
+
+    Bản cũ chỉ GET một URL Cloud Run hardcode và coi 404 là thành công — điều đó
+    không chứng minh được server nói đúng giao thức MCP.
+    """
+    print(f"\n[4/5] MCP server tại {MCP_SERVER_URL}")
+
     try:
-        import httpx
-        import asyncio
-        
-        async def test_connection():
-            async with httpx.AsyncClient() as client:
-                response = await client.get(server_url, timeout=10.0)
-                return response.status_code
-        
-        status_code = asyncio.run(test_connection())
-        
-        if status_code in [200, 404]:  # 404 is expected for GET on MCP endpoint
-            print(f"✅ MCP server reachable at {server_url}")
-            return True
-        else:
-            print(f"⚠️  MCP server returned status {status_code}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Cannot reach MCP server: {e}")
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+    except ImportError:
+        print("  FAIL: thiếu mcp SDK. Chạy: uv sync")
         return False
 
-def check_agent_import():
-    """Try to import the agent"""
-    print("\n🔍 Checking agent import...")
-    
+    async def handshake():
+        async with streamablehttp_client(MCP_SERVER_URL) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                init = await session.initialize()
+                tools = await session.list_tools()
+                resources = await session.list_resources()
+                return init, tools.tools, resources.resources
+
     try:
-        # Suppress warnings during import
+        init, tools, resources = asyncio.run(asyncio.wait_for(handshake(), timeout=20))
+    except asyncio.TimeoutError:
+        print("  FAIL: server không phản hồi trong 20 giây")
+        print("  Sửa: cd ../mcp-server && uv run python weather.py")
+        return False
+    except Exception as exc:
+        print(f"  FAIL: không bắt tay được — {type(exc).__name__}: {exc}")
+        print("  Sửa: cd ../mcp-server && uv run python weather.py")
+        return False
+
+    print(f"  OK: {init.serverInfo.name} v{init.serverInfo.version}")
+    print(f"  OK: {len(tools)} tool — {', '.join(t.name for t in tools)}")
+    print(f"  OK: {len(resources)} resource — {', '.join(str(r.uri) for r in resources)}")
+    return True
+
+
+def check_agent_import() -> bool:
+    print("\n[5/5] Import agent")
+    try:
         import warnings
+
         warnings.filterwarnings("ignore")
-        
         from weather_agent import root_agent
-        print(f"✅ Agent imported successfully: {root_agent.name}")
-        print(f"   Model: {root_agent.model}")
+
+        tool_count = len(root_agent.tools) if root_agent.tools else 0
+        print(f"  OK: {root_agent.name} · model {root_agent.model}")
+        if tool_count == 0:
+            print("  WARN: agent đang ở chế độ fallback, chưa gắn được MCP toolset")
         return True
-    except Exception as e:
-        print(f"❌ Failed to import agent: {e}")
+    except Exception as exc:
+        print(f"  FAIL: {type(exc).__name__}: {exc}")
         return False
 
-def main():
-    """Run all verification checks"""
+
+def main() -> int:
     print("=" * 60)
-    print("Weather Agent Setup Verification")
-    print("=" * 60)
-    print()
-    
-    checks = [
+    print("Weather Agent — kiểm tra setup")
+    print("=" * 60 + "\n")
+
+    # Chạy tuần tự và giữ đủ kết quả: một bước hỏng không nên che các bước sau.
+    results = [
         check_environment(),
         check_dependencies(),
         check_agent_structure(),
         check_mcp_server(),
         check_agent_import(),
     ]
-    
+
     print("\n" + "=" * 60)
-    if all(checks):
-        print("✅ All checks passed!")
-        print("\n🚀 Ready to start!")
-        print("   Run: ./start_agent.sh")
-        print("   Or:  uv run adk web")
-        print("\n📍 Then open: http://localhost:8000")
+    if all(results):
+        print("Tất cả kiểm tra đạt. Chạy: uv run adk web")
+        print("Rồi mở http://localhost:8000 và chọn weather_agent")
         return 0
-    else:
-        print("❌ Some checks failed")
-        print("\n⚠️  Fix the issues above and run this script again")
-        return 1
+
+    print(f"{results.count(False)}/{len(results)} kiểm tra hỏng — xem chi tiết ở trên")
+    return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
-
